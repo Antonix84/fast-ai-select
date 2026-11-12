@@ -1,0 +1,75 @@
+# Fast AI Select 1.1.4
+
+Офлайн-плагин для Adobe Photoshop 2025: выделяет человека на фотографии за одну
+команду. Нейросеть MODNet работает на CPU через WebAssembly внутри UXP — без
+Python, внешних `.exe`, локального сервера и интернета. VRAM не используется.
+
+## Команды
+
+```
+Плагины → Fast AI Select → Выделить человека
+Плагины → Fast AI Select → Удалить фон
+```
+
+- **Выделить человека** — создаёт обычное выделение Photoshop.
+- **Удалить фон** — добавляет маску слоя: человек виден, фон скрыт. Маску можно
+  поправить кистью или применить навсегда (`Применить маску слоя`).
+
+## Что нового в 1.1.4
+
+- Вход сети по умолчанию — 512 px вместо 384: более детальный мат на волосах и
+  мелких краях.
+- В консоль пишется версия плагина и размер входа.
+
+Полная история — в [CHANGELOG.md](https://github.com/Antonix84/fast-ai-select/blob/main/CHANGELOG.md).
+
+## Установка
+
+1. **Закройте Photoshop.** Установка при запущенном Photoshop заменяет папку
+   загруженного плагина, и он пропадает из меню.
+2. Распакуйте архив.
+3. Запустите `install.bat` (Windows). Плагин копируется в
+   `%APPDATA%\Adobe\UXP\Plugins\External\com.fastaiselect.panel_1.1.4`
+   и регистрируется в `PS.json`. Другие файлы Photoshop не изменяются.
+4. Запустите Photoshop и откройте `Плагины → Fast AI Select`.
+
+Удаление — `uninstall.bat` или `tools\install.ps1 -Uninstall`.
+
+Альтернатива для разработки: UXP Developer Tool → `Add Plugin…` →
+`plugin/manifest.json` → `Load`.
+
+## Требования
+
+- Adobe Photoshop 26.0+ (2025). Проверено на 26.11.
+- Windows 10/11 (установщик) или macOS (ручная установка / UXP Developer Tool).
+- Процессор с WebAssembly SIMD; без SIMD работает, но медленнее.
+- UXP Developer Mode включён.
+
+## Производительность
+
+Замеры на Node 24 / V8 (тот же JS-движок, что в UXP), фото 24 МП:
+
+| Этап | Время |
+| --- | --- |
+| Нейросеть 512 px (SIMD) | ~0,78 с |
+| Guided filter 24 МП | ~0,23–0,30 с |
+| Загрузка модели + wasm + прогрев | ~1 с (один раз за сеанс) |
+| Полное действие на 24 МП | ~1,2–2,0 с |
+
+## Автономность
+
+- В манифесте нет `requiredPermissions`: сеть и пользовательские файлы
+  недоступны.
+- Модель и wasm лежат в папке плагина; изображение не покидает компьютер.
+- Модель MODNet — Apache-2.0, ONNX Runtime — MIT. Подробности в
+  [THIRD_PARTY_NOTICES.md](https://github.com/Antonix84/fast-ai-select/blob/main/THIRD_PARTY_NOTICES.md).
+
+## Контрольные суммы
+
+```
+SHA256SUMS-1.1.4.txt
+```
+
+## Лицензия
+
+MIT. Copyright (c) 2026 Antonix84. См. [LICENSE](https://github.com/Antonix84/fast-ai-select/blob/main/LICENSE).

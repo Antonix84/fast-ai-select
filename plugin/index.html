@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <title>Fast AI Select</title>
+</head>
+<body>
+  <!--
+    Command-only plugin: there is no panel and no visible UI.
+
+    Script order matters:
+      1. wasm-env.js patches fetch/WebAssembly before ORT is used.
+      2. ort.wasm.min.js defines the global `ort` namespace.
+      3. Pure JS helpers, engine and Photoshop bridge.
+      4. index.js registers the two UXP menu commands last.
+  -->
+  <script src="js/wasm-env.js"></script>
+  <script src="lib/ort.wasm.min.js"></script>
+  <script src="js/core.js"></script>
+  <script src="guided_filter.js"></script>
+  <script src="js/engine.js"></script>
+  <script src="js/ps.js"></script>
+  <script src="index.js"></script>
+</body>
+</html>

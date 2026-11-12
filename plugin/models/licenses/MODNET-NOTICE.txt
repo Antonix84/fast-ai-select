@@ -1,0 +1,18 @@
+MODNet — Trimap-Free Portrait Matting
+=====================================
+
+Project:  https://github.com/ZHKKKe/MODNet
+Author:   Zhanghan Ke and contributors
+License:  Apache License 2.0 (see MODNET-LICENSE.txt in this folder)
+
+Model file bundled with this plugin:
+  modnet_photographic_portrait_matting.onnx
+
+The ONNX conversion was obtained from:
+  https://huggingface.co/TheEeeeLin/HivisionIDPhotos_matting
+
+The model is used unmodified for on-device portrait matting. It runs locally
+through onnxruntime-web; no image or model data leaves the computer.
+
+The Apache License 2.0 requires preservation of this notice and the license
+text when the model is redistributed.

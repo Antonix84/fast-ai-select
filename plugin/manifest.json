@@ -1,0 +1,27 @@
+{
+  "id": "com.fastaiselect.panel",
+  "name": "Fast AI Select",
+  "version": "1.1.4",
+  "main": "index.html",
+  "manifestVersion": 5,
+  "host": {
+    "app": "PS",
+    "minVersion": "26.0.0"
+  },
+  "entrypoints": [
+    {
+      "type": "command",
+      "id": "selectPerson",
+      "label": {
+        "default": "Выделить человека"
+      }
+    },
+    {
+      "type": "command",
+      "id": "removeBackground",
+      "label": {
+        "default": "Удалить фон"
+      }
+    }
+  ]
+}
