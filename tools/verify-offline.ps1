@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Verifies that plugin/ is complete and fully offline.
@@ -91,6 +91,11 @@ Check-True ($manifest.id -eq 'com.fastaiselect.panel') "plugin id" "unexpected p
 Check-True ([string]$manifest.host.app -eq 'PS') "Photoshop host" "host is not PS"
 Check-True (-not ($manifest.PSObject.Properties.Name -contains 'requiredPermissions')) "no permissions requested" "requiredPermissions must stay empty (offline plugin)"
 
+$indexSource = Get-Content (Join-Path $pluginDir 'index.js') -Raw
+$versionMatch = [regex]::Match($indexSource, "var VERSION = '([^']+)'")
+Check-True ($versionMatch.Success -and $versionMatch.Groups[1].Value -eq [string]$manifest.version) `
+    "index.js version matches manifest" "index.js and manifest versions differ"
+
 $panelIds = @($manifest.entrypoints | Where-Object { $_.type -eq 'panel' } | ForEach-Object { $_.id })
 $commandIds = @($manifest.entrypoints | Where-Object { $_.type -eq 'command' } | ForEach-Object { $_.id })
 Check-True ($panelIds.Count -eq 0) "no panel entrypoint (commands only)" "panel entrypoint must be removed"
@@ -107,6 +112,18 @@ Check-True ($psSource -match "putLayerMask") "layer mask path present" "putLayer
 Check-True ($psSource -match "_obj:\s*'delete'") "clear pixels via batchPlay" "pixel delete missing"
 Check-True (-not ($psSource -match 'doc\.selection')) "no unsupported Document.selection API" "uses Document.selection, which PS 2025 lacks"
 Check-True (-not ($psSource -cmatch 'layer\.clear\s*\(')) "no unsupported Layer.clear API" "uses Layer.clear, which PS 2025 lacks"
+Check-True ($psSource -match 'assertActiveDocument') "writes re-check the active document" "active document check missing"
+Check-True ($psSource -match 'colorProfile: SRGB_PROFILE') "pixels requested in sRGB" "sRGB pixel request missing"
+Check-True ($psSource -match 'request\.layerID') "cut reads the target layer" "target layer read missing"
+
+$engineSource = Get-Content (Join-Path $pluginDir 'js\engine.js') -Raw
+Check-True ($engineSource -match 'targetLong !== 768') `
+    "768 mode is accepted" "768 mode is not accepted"
+Check-True ($engineSource -match 'invalidateSession') "hung ORT session can be invalidated" "session invalidation missing"
+
+$coreSource = Get-Content (Join-Path $pluginDir 'js\core.js') -Raw
+Check-True ($coreSource -match 'contentWidth') "letterbox content rectangle present" "letterbox layout missing"
+Check-True ($coreSource -match 'makeWeightedRanges') "fractional area resize present" "area resize missing"
 
 Section "Installer file list"
 $installer = Get-Content (Join-Path $repoRoot 'tools\install.ps1') -Raw
@@ -122,10 +139,19 @@ else {
     Fail "cannot read the installer file list"
 }
 
+Section "Installer safety"
+$installerSource = Get-Content (Join-Path $repoRoot 'tools\install.ps1') -Raw
+Check-True ($installerSource -match 'fast-ai-select-stage') "install is staged before replacement" "staging directory missing"
+Check-True ($installerSource -match 'Assert-CopyMatchesSource') "staged copy is hash-verified" "copy verification missing"
+Check-True ($installerSource -match 'File\]::Replace') "PS.json is replaced atomically" "atomic PS.json write missing"
+Check-True ($installerSource -match 'corrupt-') "damaged PS.json is preserved" "corrupt PS.json preservation missing"
+
 Section "Edge refinement"
 $guideSource = Get-Content (Join-Path $pluginDir 'guided_filter.js') -Raw
 Check-True ($guideSource -match 'radiusFull\s*/\s*subsample') "radius scaled to the coarse grid" "guided filter radius is not scaled by subsample"
 Check-True ($guideSource -match 'sharpen') "matte sharpening present" "matte sharpening missing"
+Check-True ($guideSource -match 'respectSourceAlpha') "source alpha mode is explicit" "source alpha mode missing"
+Check-True (-not ($guideSource -match 'pairInside|rowMax')) "no unsafe block classification shortcuts" "unsafe guided-filter shortcuts remain"
 
 Section "Offline network scan"
 $sourceFiles = @(

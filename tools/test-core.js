@@ -42,8 +42,21 @@ section('computeInputSize');
   check('portrait 4000x6000 -> 256x384', b.width === 256 && b.height === 384, JSON.stringify(b));
 
   const c = core.computeInputSize(4000, 6000, 512, 32);
-  // 341.3 px wide, rounded to the nearest multiple of 32.
-  check('portrait high -> 352x512', c.width === 352 && c.height === 512, JSON.stringify(c));
+  // 341.3 px wide, centered on a 352 px wide multiple-of-32 canvas.
+  check('portrait high -> 352x512 canvas',
+    c.width === 352 && c.height === 512, JSON.stringify(c));
+  check('portrait content keeps its aspect ratio',
+    c.contentWidth === 341 && c.contentHeight === 512 &&
+    c.offsetX === 5 && c.offsetY === 0, JSON.stringify(c));
+  check('letterbox aspect distortion is below 0.5%',
+    Math.abs((c.contentWidth / c.contentHeight) / (4000 / 6000) - 1) < 0.005,
+    (c.contentWidth / c.contentHeight) + ' vs ' + (4000 / 6000));
+
+  const wide = core.computeInputSize(10000, 1000, 512, 32);
+  check('extreme wide image keeps aspect and is padded vertically',
+    wide.width === 512 && wide.height === 64 &&
+    wide.contentWidth === 512 && wide.contentHeight === 51 &&
+    wide.offsetY === 6, JSON.stringify(wide));
 
   const d = core.computeInputSize(1000, 999, 384, 32);
   check('odd aspect stays multiple of 32',
@@ -113,6 +126,48 @@ section('rgbToTensorChw');
   }
   const t3 = core.rgbToTensorChw(rgba, 4, 4, 4, 4, 4);
   check('RGBA stride respected', nearly(t3.data[0], (200 * 2) / 255 - 1, 1e-6));
+
+  // Upscaling must interpolate, not repeat source pixels (nearest-neighbour).
+  const small = new Uint8Array([
+    0, 0, 0, 100, 100, 100,
+    200, 200, 200, 255, 255, 255,
+  ]);
+  const up = core.rgbToTensorChw(small, 2, 2, 3, 4, 4);
+  check('bilinear upscale interpolates horizontally',
+    nearly(up.data[1], (25 * 2) / 255 - 1, 1e-6),
+    String(up.data[1]));
+
+  const constant = new Uint8Array(2 * 2 * 3).fill(50);
+  const upConstant = core.rgbToTensorChw(constant, 2, 2, 3, 7, 5);
+  let constantOk = true;
+  for (let i = 0; i < upConstant.data.length; i++) {
+    if (!nearly(upConstant.data[i], (50 * 2) / 255 - 1, 1e-6)) constantOk = false;
+  }
+  check('bilinear upscale preserves a constant field', constantOk);
+
+  // Letterbox padding must not leave black/zero bands in the tensor.
+  const red = new Uint8Array(4 * 2 * 3);
+  for (let i = 0; i < 4 * 2; i++) red[i * 3] = 255;
+  const padded = core.rgbToTensorChw(red, 4, 2, 3, 8, 8, null, {
+    offsetX: 2, offsetY: 3, contentWidth: 4, contentHeight: 2,
+  });
+  let paddedOk = true;
+  const plane = 8 * 8;
+  for (let channel = 0; channel < 3; channel++) {
+    const expected = channel === 0 ? 1 : -1;
+    for (let i = 0; i < plane; i++) {
+      if (!nearly(padded.data[channel * plane + i], expected, 1e-6)) paddedOk = false;
+    }
+  }
+  check('letterbox padding replicates the edge', paddedOk);
+
+  const fractional = new Uint8Array([
+    0, 0, 0, 50, 50, 50, 100, 100, 100, 150, 150, 150, 200, 200, 200,
+  ]);
+  const fractionalDown = core.rgbToTensorChw(fractional, 5, 1, 3, 2, 1);
+  check('fractional downscale uses partial edge weights',
+    nearly(fractionalDown.data[0], (40 * 2) / 255 - 1, 1e-6),
+    String(fractionalDown.data[0]));
 }
 
 /* ------------------------------------------------------------------ */
@@ -135,6 +190,15 @@ section('resizeAlphaBilinear');
   same = true;
   for (let i = 0; i < down.length; i++) if (!nearly(down[i], 0.42, 1e-6)) same = false;
   check('constant field preserved when downscaling', same);
+
+  // A one-pixel hair must contribute to the downscaled matte instead of being
+  // skipped by point sampling.
+  const thin = new Float32Array(8 * 8);
+  thin[3 * 8 + 3] = 1;
+  const thinDown = core.resizeAlphaBilinear(thin, 8, 8, 2, 2);
+  const expectedThin = 1 / 16;
+  check('alpha downscale preserves thin details',
+    nearly(thinDown[0], expectedThin, 1e-5), String(thinDown[0]));
 }
 
 /* ------------------------------------------------------------------ */
@@ -190,10 +254,37 @@ section('guided filter');
   let clearedAll = true;
   for (let i = 0; i < cleared.mask.length; i++) if (cleared.mask[i] !== 0) clearedAll = false;
   check('transparent RGBA pixels are masked out', clearedAll);
+
+  const halfRgba = new Uint8Array(w * h * 4).fill(255);
+  for (let i = 0; i < w * h; i++) halfRgba[i * 4 + 3] = 128;
+  const half = guided.refine({
+    rgb: halfRgba, width: w, height: h, components: 4,
+    alpha: new Float32Array(32 * 24).fill(0.5), alphaW: 32, alphaH: 24,
+  });
+  check('sharpening happens before source alpha',
+    half.mask[w * h / 2 + w / 2] >= 63 && half.mask[w * h / 2 + w / 2] <= 65,
+    String(half.mask[w * h / 2 + w / 2]));
+
+  const cutMask = guided.refine({
+    rgb: halfRgba, width: w, height: h, components: 4,
+    alpha: new Float32Array(32 * 24).fill(0.5), alphaW: 32, alphaH: 24,
+    respectSourceAlpha: false,
+  });
+  check('layer-mask mode does not apply source alpha twice',
+    cutMask.mask[w * h / 2 + w / 2] === 128,
+    String(cutMask.mask[w * h / 2 + w / 2]));
+
+  const softAlpha = guided.refine({
+    rgb, width: w, height: h, components: 3,
+    alpha: new Float32Array(32 * 24).fill(0.3), alphaW: 32, alphaH: 24,
+  });
+  check('default contrast preserves weak semi-transparent hair',
+    softAlpha.mask[0] >= 55 && softAlpha.mask[0] <= 57,
+    String(softAlpha.mask[0]));
 }
 
 /* ------------------------------------------------------------------ */
-section('optimized refine matches a brute-force reference');
+section('refine matches a brute-force reference');
 
 {
   const w = 128;
@@ -222,6 +313,8 @@ section('optimized refine matches a brute-force reference');
 
   const outW = Math.ceil(w / s);
   const outH = Math.ceil(h / s);
+  const xAxis = guided.makeAxisInterpolation(w, outW, s);
+  const yAxis = guided.makeAxisInterpolation(h, outH, s);
   const guide = guided.downsampleGuideLuma(rgb, w, h, 3, outW, outH, s);
   const p = core.resizeAlphaBilinear(alpha, aw, ah, outW, outH);
   const coarseRadius = Math.max(1, Math.round(8 / s));
@@ -229,21 +322,13 @@ section('optimized refine matches a brute-force reference');
 
   const reference = new Uint8Array(w * h);
   for (let y = 0; y < h; y++) {
-    let sy = (y + 0.5) / s - 0.5;
-    if (sy < 0) sy = 0;
-    if (sy > outH - 1) sy = outH - 1;
-    const iy0 = Math.floor(sy);
-    const fy = sy - iy0;
-    let iy1 = iy0 + 1;
-    if (iy1 >= outH) iy1 = outH - 1;
+    const iy0 = yAxis.lo[y];
+    const iy1 = yAxis.hi[y];
+    const fy = yAxis.weight[y];
     for (let x = 0; x < w; x++) {
-      let sx = (x + 0.5) / s - 0.5;
-      if (sx < 0) sx = 0;
-      if (sx > outW - 1) sx = outW - 1;
-      const ix0 = Math.floor(sx);
-      const fx = sx - ix0;
-      let ix1 = ix0 + 1;
-      if (ix1 >= outW) ix1 = outW - 1;
+      const ix0 = xAxis.lo[x];
+      const ix1 = xAxis.hi[x];
+      const fx = xAxis.weight[x];
       const b00 = coeff.a[iy0 * outW + ix0];
       const b01 = coeff.a[iy0 * outW + ix1];
       const b10 = coeff.a[iy1 * outW + ix0];
@@ -276,6 +361,137 @@ section('optimized refine matches a brute-force reference');
   }
   check('fast refine matches full evaluation (<= 1 level)', diffCount === 0,
     'max diff ' + maxDiff + ', pixels > 1: ' + diffCount);
+}
+
+/* ------------------------------------------------------------------ */
+section('refine is exact on irregular sizes, RGBA and strong contrast');
+
+{
+  function referenceRefine(opts) {
+    const width = opts.width;
+    const height = opts.height;
+    const s = opts.subsample || 4;
+    const outW = Math.ceil(width / s);
+    const outH = Math.ceil(height / s);
+    const xAxis = guided.makeAxisInterpolation(width, outW, s);
+    const yAxis = guided.makeAxisInterpolation(height, outH, s);
+    const guide = guided.downsampleGuideLuma(
+      opts.rgb, width, height, opts.components, outW, outH, s);
+    const p = core.resizeAlphaBilinear(
+      opts.alpha, opts.alphaW, opts.alphaH, outW, outH);
+    const coeff = guided.guidedFilterCoefficients(
+      guide, p, outW, outH, Math.max(1, Math.round((opts.radius || 8) / s)),
+      opts.eps === undefined ? 1e-4 : opts.eps);
+    const sharpen = opts.sharpen === undefined ? 1.4 : opts.sharpen;
+    const respectAlpha = opts.respectSourceAlpha !== false;
+    const out = new Uint8Array(width * height);
+
+    for (let y = 0; y < height; y++) {
+      const iy0 = yAxis.lo[y];
+      const iy1 = yAxis.hi[y];
+      const fy = yAxis.weight[y];
+      for (let x = 0; x < width; x++) {
+        const ix0 = xAxis.lo[x];
+        const ix1 = xAxis.hi[x];
+        const fx = xAxis.weight[x];
+        const pa = [
+          coeff.a[iy0 * outW + ix0], coeff.a[iy0 * outW + ix1],
+          coeff.a[iy1 * outW + ix0], coeff.a[iy1 * outW + ix1],
+        ];
+        const pb = [
+          coeff.b[iy0 * outW + ix0], coeff.b[iy0 * outW + ix1],
+          coeff.b[iy1 * outW + ix0], coeff.b[iy1 * outW + ix1],
+        ];
+        const av = (pa[0] + (pa[1] - pa[0]) * fx) * (1 - fy) +
+          (pa[2] + (pa[3] - pa[2]) * fx) * fy;
+        const bv = (pb[0] + (pb[1] - pb[0]) * fx) * (1 - fy) +
+          (pb[2] + (pb[3] - pb[2]) * fx) * fy;
+        const i = (y * width + x) * opts.components;
+        const luma = (77 * opts.rgb[i] + 150 * opts.rgb[i + 1] +
+          29 * opts.rgb[i + 2] + 128) >> 8;
+        let q = av * (luma / 255) + bv;
+        q = 0.5 + (q - 0.5) * sharpen;
+        if (q < 0) q = 0;
+        if (q > 1) q = 1;
+        if (respectAlpha && opts.components === 4) q *= opts.rgb[i + 3] / 255;
+        out[y * width + x] = (q * 255 + 0.5) | 0;
+      }
+    }
+    return out;
+  }
+
+  let seed = 1234567;
+  function random() {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    return seed / 4294967296;
+  }
+
+  const width = 61;
+  const height = 47;
+  const aw = 17;
+  const ah = 13;
+  const alpha = new Float32Array(aw * ah);
+  for (let i = 0; i < alpha.length; i++) alpha[i] = random();
+
+  const rgb = new Uint8Array(width * height * 3);
+  for (let i = 0; i < width * height; i++) {
+    rgb[i * 3] = (random() * 255) | 0;
+    rgb[i * 3 + 1] = (random() * 255) | 0;
+    rgb[i * 3 + 2] = (random() * 255) | 0;
+  }
+
+  const opts = {
+    rgb, width, height, components: 3,
+    alpha, alphaW: aw, alphaH: ah,
+    subsample: 4, radius: 8, sharpen: 1.4,
+  };
+  const expected = referenceRefine(opts);
+  const actual = guided.refine(opts);
+  let bad = 0;
+  let maxDiff = 0;
+  for (let i = 0; i < expected.length; i++) {
+    const d = Math.abs(expected[i] - actual.mask[i]);
+    if (d > maxDiff) maxDiff = d;
+    if (d > 1) bad++;
+  }
+  check('random irregular RGB/RGBA matte matches full evaluation',
+    bad === 0, 'max diff ' + maxDiff + ', pixels > 1: ' + bad);
+
+  const rgba = new Uint8Array(width * height * 4);
+  for (let i = 0; i < width * height; i++) {
+    rgba[i * 4] = (random() * 255) | 0;
+    rgba[i * 4 + 1] = (random() * 255) | 0;
+    rgba[i * 4 + 2] = (random() * 255) | 0;
+    rgba[i * 4 + 3] = (random() * 256) | 0;
+  }
+  const rgbaOpts = {
+    rgb: rgba, width, height, components: 4,
+    alpha, alphaW: aw, alphaH: ah,
+    subsample: 4, radius: 12, sharpen: 2,
+  };
+  const rgbaExpected = referenceRefine(rgbaOpts);
+  const rgbaActual = guided.refine(rgbaOpts);
+  bad = 0;
+  maxDiff = 0;
+  for (let i = 0; i < rgbaExpected.length; i++) {
+    const d = Math.abs(rgbaExpected[i] - rgbaActual.mask[i]);
+    if (d > maxDiff) maxDiff = d;
+    if (d > 1) bad++;
+  }
+  check('RGBA with partial alpha and sharpen=2 matches full evaluation',
+    bad === 0, 'max diff ' + maxDiff + ', pixels > 1: ' + bad);
+}
+
+/* ------------------------------------------------------------------ */
+section('coarse-cell interpolation');
+
+{
+  const axis = guided.makeAxisInterpolation(10, 3, 4);
+  check('last partial cell uses its real center',
+    axis.centers[2] === 8.5, String(axis.centers[2]));
+  check('right border clamps to the last cell',
+    axis.lo[9] === 2 && axis.hi[9] === 2 && axis.weight[9] === 0,
+    axis.lo[9] + '/' + axis.hi[9] + '/' + axis.weight[9]);
 }
 
 /* ------------------------------------------------------------------ */

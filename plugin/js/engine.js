@@ -17,6 +17,7 @@
   var sessionInfo = null;
   var sessionPromise = null;
   var lastError = null;
+  var generation = 0;
 
   /* Same 50-byte SIMD probe that onnxruntime-web uses internally. */
   var SIMD_PROBE = new Uint8Array([
@@ -156,20 +157,63 @@
     if (sessionInfo) return Promise.resolve(sessionInfo);
     if (sessionPromise) return sessionPromise;
 
-    sessionPromise = loadSession(onProgress).then(
+    var expectedGeneration = generation;
+    var promise = loadSession(onProgress).then(
       function (info) {
+        if (expectedGeneration !== generation) {
+          throw new Error('Инициализация нейросети была отменена.');
+        }
         sessionInfo = info;
-        sessionPromise = null;
+        if (sessionPromise === promise) sessionPromise = null;
         lastError = null;
         return info;
       },
       function (error) {
-        sessionPromise = null;
-        lastError = error;
+        if (sessionPromise === promise) sessionPromise = null;
+        if (expectedGeneration === generation) lastError = error;
         throw error;
       }
     );
-    return sessionPromise;
+    sessionPromise = promise;
+    return promise;
+  }
+
+  /*
+   * Drop the cached session after a timeout or plugin reload. A cache entry
+   * that never settles must not poison every subsequent command. The previous
+   * session is intentionally left for GC: an ORT run may still reference it.
+   */
+  function invalidateSession(reason) {
+    generation++;
+    sessionInfo = null;
+    sessionPromise = null;
+    lastError = reason || new Error('Сессия нейросети сброшена.');
+  }
+
+  function cropAlphaToContent(alpha, alphaW, alphaH, size) {
+    if (size.offsetX === 0 && size.offsetY === 0 &&
+        size.contentWidth === size.width && size.contentHeight === size.height) {
+      return { data: alpha, width: alphaW, height: alphaH };
+    }
+
+    var scaleX = alphaW / size.width;
+    var scaleY = alphaH / size.height;
+    var x0 = Math.max(0, Math.round(size.offsetX * scaleX));
+    var y0 = Math.max(0, Math.round(size.offsetY * scaleY));
+    var w = Math.max(1, Math.round(size.contentWidth * scaleX));
+    var h = Math.max(1, Math.round(size.contentHeight * scaleY));
+    if (x0 + w > alphaW) w = alphaW - x0;
+    if (y0 + h > alphaH) h = alphaH - y0;
+    if (w <= 0 || h <= 0) {
+      throw new Error('Нейросеть вернула некорректный размер мата.');
+    }
+
+    var cropped = new Float32Array(w * h);
+    for (var y = 0; y < h; y++) {
+      var src = (y0 + y) * alphaW + x0;
+      cropped.set(alpha.subarray(src, src + w), y * w);
+    }
+    return { data: cropped, width: w, height: h };
   }
 
   /*
@@ -185,15 +229,24 @@
     onProgress = onProgress || function () {};
 
     var started = now();
+    var expectedGeneration = generation;
     var info = await ensureSession(onProgress);
+    if (expectedGeneration !== generation) {
+      throw new Error('Расчёт был отменён до запуска нейросети.');
+    }
     var ort = getOrt();
 
-    var targetLong = opts.targetLong === 512 ? 512 : 384;
+    var targetLong = Number(opts.targetLong || 512);
+    if (targetLong !== 384 && targetLong !== 512 && targetLong !== 768) {
+      throw new Error('Недопустимый размер входа нейросети: ' + targetLong +
+        '. Используйте 384, 512 или 768.');
+    }
     var size = global.FASCore.computeInputSize(opts.width, opts.height, targetLong, 32);
 
     onProgress({
       stage: 'preprocess',
-      text: 'Подготовка ' + size.width + '×' + size.height + '…'
+      text: 'Подготовка ' + size.contentWidth + '×' + size.contentHeight +
+        ' (вход ' + size.width + '×' + size.height + ')…'
     });
     await yieldUI();
 
@@ -204,7 +257,9 @@
       opts.height,
       opts.components || 3,
       size.width,
-      size.height
+      size.height,
+      null,
+      size
     );
     var tensor = new ort.Tensor('float32', input.data, [1, 3, size.height, size.width]);
     var preprocessEnd = now();
@@ -222,28 +277,42 @@
     if (!output || !output.data) {
       throw new Error('Нейросеть вернула пустой результат.');
     }
+    if (expectedGeneration !== generation) {
+      throw new Error('Расчёт нейросети был отменён.');
+    }
 
     var dims = output.dims || [];
     var alphaW = dims.length >= 2 ? dims[dims.length - 1] : size.width;
     var alphaH = dims.length >= 2 ? dims[dims.length - 2] : size.height;
     var alpha = new Float32Array(output.data);
+    var croppedAlpha = cropAlphaToContent(alpha, alphaW, alphaH, size);
     var inferenceEnd = now();
 
     onProgress({ stage: 'refine', text: 'Уточнение краёв (guided filter)…' });
     await yieldUI();
+
+    var pixelScale = Math.max(
+      opts.width / croppedAlpha.width,
+      opts.height / croppedAlpha.height
+    );
+    var adaptiveRadius = Math.max(4, Math.min(16, Math.round(pixelScale)));
+    var radius = typeof opts.radius === 'number' ? opts.radius : adaptiveRadius;
+    var refineSubsample = typeof opts.subsample === 'number' ? opts.subsample : 4;
+    var refineSharpen = typeof opts.sharpen === 'number' ? opts.sharpen : 1.4;
 
     var refined = global.FASGuidedFilter.refine({
       rgb: opts.rgb,
       width: opts.width,
       height: opts.height,
       components: opts.components || 3,
-      alpha: alpha,
-      alphaW: alphaW,
-      alphaH: alphaH,
-      subsample: 4,
-      radius: 8,
+      alpha: croppedAlpha.data,
+      alphaW: croppedAlpha.width,
+      alphaH: croppedAlpha.height,
+      subsample: refineSubsample,
+      radius: radius,
       eps: 1e-4,
-      sharpen: 2
+      sharpen: refineSharpen,
+      respectSourceAlpha: opts.respectSourceAlpha !== false
     });
     var refineEnd = now();
 
@@ -253,8 +322,12 @@
       height: refined.height,
       inputWidth: size.width,
       inputHeight: size.height,
-      alphaWidth: alphaW,
-      alphaHeight: alphaH,
+      contentWidth: size.contentWidth,
+      contentHeight: size.contentHeight,
+      alphaWidth: croppedAlpha.width,
+      alphaHeight: croppedAlpha.height,
+      radius: refined.radiusFull,
+      sharpen: refined.sharpen,
       simd: info.simd,
       timings: {
         preprocess: preprocessEnd - preprocessStart,
@@ -286,6 +359,7 @@
 
   global.FASEngine = {
     ensureSession: ensureSession,
+    invalidate: invalidateSession,
     segment: segment,
     isReady: isReady,
     getInfo: getInfo,

@@ -46,6 +46,10 @@
     groupend: 13
   };
 
+  var SRGB_PROFILE = 'sRGB IEC61966-2.1';
+  var SELECTION_REF = { _ref: 'channel', _property: 'selection' };
+  var PLAY_OPTIONS = { dialogOptions: 'dontDisplay' };
+
   function kindCode(kind) {
     if (typeof kind === 'number' && isFinite(kind)) return kind;
     if (kind === null || kind === undefined) return 0;
@@ -72,14 +76,29 @@
     }
   }
 
-  var SELECTION_REF = { _ref: 'channel', _property: 'selection' };
-  var PLAY_OPTIONS = { dialogOptions: 'dontDisplay' };
+  function isBackground(layer) {
+    return layer.id === 1 || kindCode(layer.kind) === KIND_BACKGROUND;
+  }
 
+  /*
+   * The modal callback re-checks that the original document is still active.
+   * executeAsModal has no per-document target option, and batchPlay layer IDs
+   * are resolved inside the active document. Aborting is safer than writing a
+   * mask into a document the user switched to while inference was running.
+   */
   function withModal(fn, commandName) {
     return core.executeAsModal(fn, {
       commandName: commandName || 'Fast AI Select',
       interactive: false
     });
+  }
+
+  function assertActiveDocument(doc) {
+    var active = app.activeDocument;
+    if (!active || active.id !== doc.id) {
+      throw new Error('Активный документ был изменён во время обработки. ' +
+        'Вернитесь в исходный документ и повторите команду.');
+    }
   }
 
   function findDocument(docId) {
@@ -112,10 +131,6 @@
     return layers.length ? layers[0] : null;
   }
 
-  function isBackground(layer) {
-    return layer.id === 1 || kindCode(layer.kind) === KIND_BACKGROUND;
-  }
-
   function documentInfo() {
     var doc = app.activeDocument;
     if (!doc) return null;
@@ -145,11 +160,35 @@
     return info;
   }
 
+  function assertDocumentSize(doc, width, height) {
+    if (Math.round(doc.width) !== width || Math.round(doc.height) !== height) {
+      throw new Error('Размер документа изменился во время обработки. Повторите команду.');
+    }
+  }
+
+  function assertCutLayer(doc, layer) {
+    if (!layer) throw new Error('Активный слой был изменён во время обработки.');
+    var background = isBackgroundLayer(doc, layer);
+    if (!background && !isPixelKind(layer.kind)) {
+      throw new Error(
+        'Удаление фона работает только с пиксельным слоем. ' +
+        'Растрируйте слой (Слой → Растрировать) и повторите.'
+      );
+    }
+    /* Background is inherently locked; promotion is handled separately. */
+    if (!background && layer.locked) {
+      throw new Error('Слой заблокирован. Снимите блокировку пикселей и повторите.');
+    }
+  }
+
   /*
-   * Read the composite document pixels as 8-bit chunky RGB (or RGBA when the
-   * composite has alpha). Returns the actual region Photoshop produced.
+   * Read document pixels as 8-bit chunky RGB/RGBA. When layerId is supplied,
+   * read that layer instead of the flattened composite. `colorProfile` forces
+   * the same sRGB values for MODNet and the guided filter regardless of the
+   * document's working profile. Older builds that reject the profile fall back
+   * to their default RGB conversion.
    */
-  async function readPixels(docId) {
+  async function readPixels(docId, layerId) {
     var doc = findDocument(docId);
     var result = null;
     var image = null;
@@ -160,12 +199,26 @@
 
     await withModal(async function () {
       try {
-        result = await imaging.getPixels({
+        assertActiveDocument(doc);
+        var request = {
           documentID: doc.id,
           applyAlpha: false,
           componentSize: 8,
           colorSpace: 'RGB'
-        });
+        };
+        if (layerId !== undefined && layerId !== null) request.layerID = layerId;
+
+        try {
+          result = await imaging.getPixels(Object.assign({}, request, {
+            colorProfile: SRGB_PROFILE
+          }));
+        } catch (profileError) {
+          var profileMessage = String(profileError && (profileError.message || profileError));
+          console.warn('Fast AI Select: sRGB pixel read failed, retrying without profile: ' +
+            profileMessage);
+          result = await imaging.getPixels(request);
+        }
+
         image = result && result.imageData;
         if (!image) throw new Error('Photoshop не вернул пиксели документа.');
 
@@ -190,6 +243,7 @@
     var bounds = (result && result.sourceBounds) || { left: 0, top: 0 };
     return {
       docId: doc.id,
+      layerId: layerId,
       docWidth: Math.round(doc.width),
       docHeight: Math.round(doc.height),
       width: width,
@@ -203,6 +257,11 @@
 
   /* Pad a mask for a trimmed read back to the full document canvas. */
   function padMask(mask, width, height, docWidth, docHeight, left, top) {
+    width = Math.round(width);
+    height = Math.round(height);
+    if (!mask || mask.length < width * height) {
+      throw new Error('Некорректный буфер маски.');
+    }
     if (width === docWidth && height === docHeight && left === 0 && top === 0) {
       return mask;
     }
@@ -241,10 +300,13 @@
 
   async function applySelection(docId, mask, width, height) {
     return withModal(async function () {
+      var doc = findDocument(docId);
+      assertActiveDocument(doc);
+      assertDocumentSize(doc, width, height);
       var image = await createMaskImageData(mask, width, height);
       try {
         await imaging.putSelection({
-          documentID: docId,
+          documentID: doc.id,
           imageData: image,
           replace: true,
           commandName: 'Fast AI Select'
@@ -268,6 +330,9 @@
 
     try {
       await action.batchPlay([{
+        _obj: 'select',
+        _target: [{ _ref: 'layer', _id: layer.id }]
+      }, {
         _obj: 'set',
         _target: [{ _ref: 'layer', _id: layer.id }],
         to: {}
@@ -280,6 +345,9 @@
 
     if (!promoted || isBackgroundLayer(doc, promoted)) {
       await action.batchPlay([{
+        _obj: 'select',
+        _target: [{ _ref: 'layer', _id: (promoted || layer).id }]
+      }, {
         _obj: 'make',
         _target: [{ _ref: 'layer', _id: (promoted || layer).id }],
         using: { _enum: 'layerType', _value: 'normal' }
@@ -292,44 +360,50 @@
   }
 
   /*
-   * Validate the active layer before the slow part starts. Returns the layer id
-   * to cut, after converting a Background layer to a normal one.
+   * Validate the active layer before the slow part starts. This deliberately
+   * does not modify the document: a missing person or an inference failure
+   * must leave a Background layer untouched.
    */
   async function prepareCut(docId) {
     return withModal(async function () {
       var doc = findDocument(docId);
+      assertActiveDocument(doc);
       var layer = activeLayer(doc);
       if (!layer) throw new Error('Выберите слой в панели «Слои».');
       console.log('Fast AI Select: layer "' + layer.name + '", id=' + layer.id +
         ', kind=' + String(layer.kind));
 
+      assertCutLayer(doc, layer);
+      return {
+        layerId: layer.id,
+        name: layer.name,
+        background: isBackgroundLayer(doc, layer)
+      };
+    }, 'Fast AI Select: prepare layer');
+  }
+
+  /*
+   * Re-check the target after the slow inference and promote a Background only
+   * now. The user may have changed the active layer or document meanwhile.
+   */
+  async function ensureCutTarget(docId, layerId) {
+    return withModal(async function () {
+      var doc = findDocument(docId);
+      assertActiveDocument(doc);
+      var layer = findLayer(doc.layers, layerId);
+      assertCutLayer(doc, layer);
+
       if (isBackgroundLayer(doc, layer)) {
         layer = await promoteBackground(doc, layer);
-        if (isBackgroundLayer(doc, layer)) {
-          throw new Error(
-            'Не удалось разблокировать фоновый слой. ' +
-            'Выполните «Слой → Новый → Слой из фона» и повторите.'
-          );
-        }
+        assertCutLayer(doc, layer);
       }
 
-      /*
-       * Only reject layers whose kind is known to be non-pixel. Unknown kind
-       * (older builds may not expose it) is allowed: Photoshop itself refuses
-       * the clear on a Smart Object, and the error is shown to the user.
-       */
-      if (!isPixelKind(layer.kind)) {
-        throw new Error(
-          'Удаление фона работает только с пиксельным слоем. ' +
-          'Растрируйте слой (Слой → Растрировать) и повторите.'
-        );
-      }
-      if (layer.locked) {
-        throw new Error('Слой заблокирован. Снимите блокировку пикселей и повторите.');
-      }
-
-      return { layerId: layer.id, name: layer.name };
-    }, 'Fast AI Select: prepare layer');
+      return {
+        layerId: layer.id,
+        name: layer.name,
+        background: false
+      };
+    }, 'Fast AI Select: finalize layer');
   }
 
   /*
@@ -349,88 +423,143 @@
     });
   }
 
+  async function createUserMask(layerId) {
+    await action.batchPlay([{
+      _obj: 'select',
+      _target: [{ _ref: 'layer', _id: layerId }]
+    }, {
+      _obj: 'make',
+      new: { _class: 'channel' },
+      at: [{ _ref: 'channel', _enum: 'channel', _value: 'mask' }],
+      using: { _enum: 'userMaskEnabled', _value: 'revealAll' }
+    }], PLAY_OPTIONS);
+  }
+
+  async function removeUserMask(layerId) {
+    try {
+      await action.batchPlay([{
+        _obj: 'select',
+        _target: [{ _ref: 'layer', _id: layerId }]
+      }, {
+        _obj: 'delete',
+        _target: [{ _ref: 'channel', _enum: 'channel', _value: 'mask' }]
+      }], PLAY_OPTIONS);
+    } catch (e) {
+      console.warn('Fast AI Select: could not remove the temporary layer mask: ' +
+        String(e && (e.message || e)));
+    }
+  }
+
   async function applyCutMask(docId, layerId, mask, width, height) {
     return withModal(async function () {
       var doc = findDocument(docId);
+      assertActiveDocument(doc);
+      assertDocumentSize(doc, width, height);
       var layer = findLayer(doc.layers, layerId);
-      if (!layer) throw new Error('Активный слой был изменён во время обработки.');
+      assertCutLayer(doc, layer);
 
       var image = await createMaskImageData(mask, width, height);
       try {
         try {
-          await putUserMask(layerId, image, docId);
+          await putUserMask(layerId, image, doc.id);
         } catch (firstError) {
           /* Some builds need an existing user mask before putLayerMask. */
-          await action.batchPlay([{
-            _obj: 'select',
-            _target: [{ _ref: 'layer', _id: layerId }]
-          }, {
-            _obj: 'make',
-            new: { _class: 'channel' },
-            at: [{ _ref: 'channel', _enum: 'channel', _value: 'mask' }],
-            using: { _enum: 'userMaskEnabled', _value: 'revealAll' }
-          }], PLAY_OPTIONS);
-          await putUserMask(layerId, image, docId);
+          await createUserMask(layerId);
+          try {
+            await putUserMask(layerId, image, doc.id);
+          } catch (secondError) {
+            await removeUserMask(layerId);
+            throw secondError;
+          }
         }
       } finally {
         if (image && typeof image.dispose === 'function') {
           try { image.dispose(); } catch (e) { /* ignore */ }
         }
       }
+      return { method: 'mask', layerId: layerId };
     }, 'Fast AI Select: layer mask');
   }
 
   /*
    * Fallback cut: apply the mask as a selection, invert it and clear the
-   * selected pixels. The selection is created in its own modal scope, the same
-   * way the working "select" command does it, and the pixels are filled with
-   * transparency first because "Edit > Clear" is unavailable on some builds.
+   * selected pixels. The target layer is explicitly selected first because
+   * `delete` acts on the active layer, and that may have changed while the
+   * network was running. Deselection is in finally so an error cannot leave an
+   * inverted selection behind.
    */
   async function applyCutPixels(docId, layerId, mask, width, height) {
     await applySelection(docId, mask, width, height);
 
     return withModal(async function () {
       var doc = findDocument(docId);
+      assertActiveDocument(doc);
+      assertDocumentSize(doc, width, height);
       var layer = findLayer(doc.layers, layerId);
-      if (!layer) throw new Error('Активный слой был изменён во время обработки.');
-
-      /* Select > Inverse */
-      await action.batchPlay([{
-        _obj: 'inverse',
-        _target: [SELECTION_REF]
-      }], PLAY_OPTIONS);
+      assertCutLayer(doc, layer);
 
       try {
-        /* Edit > Clear */
         await action.batchPlay([{
-          _obj: 'delete',
-          _target: [SELECTION_REF],
-          _options: { dialogOptions: 'dontDisplay' }
+          _obj: 'select',
+          _target: [{ _ref: 'layer', _id: layerId }]
         }], PLAY_OPTIONS);
-      } catch (clearError) {
-        throw new Error(
-          'Не удалось очистить фон: ' + (clearError && (clearError.message || clearError))
-        );
+
+        /* Select > Inverse */
+        await action.batchPlay([{
+          _obj: 'inverse',
+          _target: [SELECTION_REF]
+        }], PLAY_OPTIONS);
+
+        try {
+          /* Edit > Clear */
+          await action.batchPlay([{
+            _obj: 'delete',
+            _target: [SELECTION_REF],
+            _options: { dialogOptions: 'dontDisplay' }
+          }], PLAY_OPTIONS);
+        } catch (clearError) {
+          throw new Error(
+            'Не удалось очистить фон: ' + (clearError && (clearError.message || clearError))
+          );
+        }
+      } finally {
+        try {
+          /* Select > Deselect, even if inverse/delete failed. */
+          await action.batchPlay([{
+            _obj: 'set',
+            _target: [SELECTION_REF],
+            to: { _enum: 'ordinal', _value: 'none' }
+          }], PLAY_OPTIONS);
+        } catch (deselectError) {
+          console.warn('Fast AI Select: could not deselect after fallback: ' +
+            String(deselectError && (deselectError.message || deselectError)));
+        }
       }
 
-      /* Select > Deselect */
-      await action.batchPlay([{
-        _obj: 'set',
-        _target: [SELECTION_REF],
-        to: { _enum: 'ordinal', _value: 'none' }
-      }], PLAY_OPTIONS);
+      return { method: 'pixels', layerId: layerId };
     }, 'Fast AI Select: remove background');
   }
 
+  function isFatalTargetError(error) {
+    var message = String(error && (error.message || error));
+    return /документ был закрыт|document.*closed|no such document|active layer.*changed|активный слой был изменён|размер документа изменился|отмен/i
+      .test(message);
+  }
+
   async function applyCut(docId, layerId, mask, width, height) {
+    var target = await ensureCutTarget(docId, layerId);
+
     try {
-      await applyCutMask(docId, layerId, mask, width, height);
-      return { method: 'mask' };
+      var masked = await applyCutMask(docId, target.layerId, mask, width, height);
+      masked.name = target.name;
+      return masked;
     } catch (maskError) {
+      if (isFatalTargetError(maskError)) throw maskError;
       console.error('Fast AI Select: layer mask failed, trying pixel clear', maskError);
       try {
-        await applyCutPixels(docId, layerId, mask, width, height);
-        return { method: 'pixels' };
+        var cleared = await applyCutPixels(docId, target.layerId, mask, width, height);
+        cleared.name = target.name;
+        return cleared;
       } catch (pixelError) {
         throw new Error(
           (maskError && (maskError.message || maskError)) + ' / ' +
@@ -447,6 +576,7 @@
     padMask: padMask,
     applySelection: applySelection,
     prepareCut: prepareCut,
+    ensureCutTarget: ensureCutTarget,
     applyCut: applyCut,
     findLayer: findLayer
   };

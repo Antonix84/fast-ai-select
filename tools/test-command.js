@@ -70,8 +70,15 @@ function createWorld(options) {
     layerMasks: [],
     alerts: [],
     modals: [],
+    modalOptions: [],
+    pixelReads: [],
     disposed: 0,
+    activeDocumentOverride: null,
     failMask: !!opts.failMask,
+    failDelete: !!opts.failDelete,
+    failEngineOnce: !!opts.failEngineOnce,
+    switchDocumentDuringEngine: !!opts.switchDocumentDuringEngine,
+    engineCalls: 0,
   };
 
   world.doc = {
@@ -106,7 +113,7 @@ function createWorld(options) {
   const photoshop = {
     app: {
       get activeDocument() {
-        return world.doc;
+        return world.activeDocumentOverride || world.doc;
       },
       get documents() {
         return world.doc ? [world.doc] : [];
@@ -118,6 +125,7 @@ function createWorld(options) {
     core: {
       async executeAsModal(fn, info) {
         world.modals.push((info && info.commandName) || 'modal');
+        world.modalOptions.push(info || {});
         return fn();
       },
     },
@@ -126,6 +134,12 @@ function createWorld(options) {
         const list = Array.isArray(commands) ? commands : [commands];
         for (const command of list) {
           world.actions.push(command);
+
+          if (world.failDelete && command._obj === 'delete' &&
+              command._target && command._target[0] &&
+              command._target[0]._property === 'selection') {
+            throw new Error('delete is not available');
+          }
 
           /* Photoshop returns a new layer id when a Background is promoted. */
           if (command._obj === 'set' && command.to &&
@@ -139,7 +153,8 @@ function createWorld(options) {
       },
     },
     imaging: {
-      async getPixels() {
+      async getPixels(options) {
+        world.pixelReads.push(options || {});
         return {
           imageData: imageData(),
           sourceBounds: { left: 0, top: 0 },
@@ -179,15 +194,25 @@ function createWorld(options) {
   const engine = {
     isReady: () => true,
     ensureSession: async () => ({ simd: true }),
-    segment: async () => ({
-      mask,
-      width: maskWidth,
-      height: maskHeight,
-      inputWidth: 384,
-      inputHeight: 288,
-      simd: true,
-      timings: { preprocess: 1, inference: 2, refine: 3, pipeline: 6 },
-    }),
+    invalidate: () => {},
+    segment: async () => {
+      world.engineCalls++;
+      if (world.failEngineOnce && world.engineCalls === 1) {
+        throw new Error('synthetic inference failure');
+      }
+      if (world.switchDocumentDuringEngine) {
+        world.activeDocumentOverride = { id: 999, name: 'other.psd' };
+      }
+      return {
+        mask,
+        width: maskWidth,
+        height: maskHeight,
+        inputWidth: 384,
+        inputHeight: 288,
+        simd: true,
+        timings: { preprocess: 1, inference: 2, refine: 3, pipeline: 6 },
+      };
+    },
   };
 
   const setup = { commands: {} };
@@ -272,6 +297,16 @@ async function main() {
     world.putSelections[0].imageData.height === 600);
   check('image data disposed', world.disposed >= 2, String(world.disposed));
   check('no alert on success', world.alerts.length === 0, world.alerts.join(' | '));
+  check('selection reads the composite, not an individual layer',
+    world.pixelReads.length === 1 && world.pixelReads[0].layerID === undefined,
+    JSON.stringify(world.pixelReads[0] || {}));
+  check('pixels are requested as sRGB',
+    world.pixelReads[0] && world.pixelReads[0].colorProfile === 'sRGB IEC61966-2.1');
+  check('modal scopes carry command names',
+    world.modalOptions.length > 0 &&
+    world.modalOptions.every((options) => typeof options.commandName === 'string' &&
+      options.targetDocID === undefined),
+    JSON.stringify(world.modalOptions));
 
   section('remove background on a Background layer');
 
@@ -282,6 +317,9 @@ async function main() {
   const kinds = world.actions.map((a) => a._obj);
   check('background promoted to a normal layer', kinds.includes('set') &&
     world.active.kind === 'pixel', 'kind ' + world.active.kind);
+  check('promotion explicitly selects the target layer first',
+    world.actions.some((a) => a._obj === 'select' &&
+      a._target && a._target[0] && a._target[0]._id === 1));
   check('layer mask applied', world.layerMasks.length === 1);
   check('mask targets the promoted layer',
     world.layerMasks[0] && world.layerMasks[0].layerID === world.active.id,
@@ -292,6 +330,9 @@ async function main() {
     world.layerMasks[0].imageData.height === 600);
   check('no selection needed for the mask path', world.putSelections.length === 0);
   check('no alert on success', world.alerts.length === 0, world.alerts.join(' | '));
+  check('cut reads pixels from the target layer',
+    world.pixelReads.length === 1 && world.pixelReads[0].layerID === 1,
+    JSON.stringify(world.pixelReads[0] || {}));
 
   section('remove background on an ordinary pixel layer');
 
@@ -312,6 +353,9 @@ async function main() {
   check('selection created in its own modal', world.putSelections.length === 1);
   check('selection inverted', fallbackKinds.includes('inverse'));
   check('pixels cleared', fallbackKinds.includes('delete'));
+  check('target layer selected before clearing',
+    world.actions.some((a) => a._obj === 'select' &&
+      a._target && a._target[0] && a._target[0]._id === 10));
   check('selection removed', fallbackKinds.includes('set') &&
     world.actions.some((a) => a._obj === 'set' && a.to && a.to._value === 'none'));
   check('no alert when the fallback works', world.alerts.length === 0,
@@ -358,6 +402,55 @@ async function main() {
   check('empty mask reported', world.alerts.some((m) => /не найден/.test(m)),
     world.alerts.join(' | '));
   check('nothing applied for an empty mask', world.putSelections.length === 0);
+
+  world = createWorld({ emptyMask: true });
+  world.setLayer(makeLayer(1, 'background'));
+  await world.setup.commands.removeBackground();
+  check('empty mask leaves a Background layer untouched',
+    world.active && world.active.id === 1 && world.active.kind === 'background',
+    world.active && (world.active.id + '/' + world.active.kind));
+
+  world = createWorld({ switchDocumentDuringEngine: true });
+  world.setLayer(makeLayer(17, 'pixel'));
+  await world.setup.commands.removeBackground();
+  check('switching documents aborts before writing',
+    world.layerMasks.length === 0 && world.putSelections.length === 0,
+    'masks ' + world.layerMasks.length + ', selections ' + world.putSelections.length);
+  check('active document change is reported',
+    world.alerts.some((m) => /Активный документ/.test(m)), world.alerts.join(' | '));
+
+  section('fallback failures and busy recovery');
+
+  world = createWorld({ failMask: true, failDelete: true });
+  world.setLayer(makeLayer(20, 'pixel'));
+  await world.setup.commands.removeBackground();
+  check('failed pixel clear is reported', world.alerts.some((m) => /Не удалось очистить/.test(m)),
+    world.alerts.join(' | '));
+  check('selection is removed even when clearing fails',
+    world.actions.some((a) => a._obj === 'set' && a.to && a.to._value === 'none'));
+
+  world = createWorld({ failEngineOnce: true });
+  world.setLayer(makeLayer(21, 'pixel'));
+  await world.setup.commands.selectPerson();
+  check('inference failure resets busy',
+    world.sandbox.FASApp.getState().busy === false,
+    JSON.stringify(world.sandbox.FASApp.getState()));
+  check('inference failure is reported', world.alerts.some((m) => /synthetic inference/.test(m)),
+    world.alerts.join(' | '));
+  await world.setup.commands.selectPerson();
+  check('the next command works after a failed inference',
+    world.putSelections.length === 1 && world.alerts.length === 1,
+    'selections ' + world.putSelections.length + ', alerts ' + world.alerts.length);
+
+  world = createWorld();
+  world.setLayer(makeLayer(22, 'pixel'));
+  await world.setup.commands.selectPerson();
+  const destroy = world.setup.plugin && world.setup.plugin.destroy;
+  if (typeof destroy === 'function') destroy();
+  await world.setup.commands.removeBackground();
+  check('destroy cancels subsequent commands',
+    world.putSelections.length === 1 && world.layerMasks.length === 0,
+    'selections ' + world.putSelections.length + ', masks ' + world.layerMasks.length);
 
   world = createWorld();
   world.doc = null;

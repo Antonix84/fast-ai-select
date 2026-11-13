@@ -1,7 +1,7 @@
 /*
  * Fast AI Select - fast guided filter for matte edge refinement.
  *
- * The neural matte is produced at 384/512 px and is therefore soft. This
+ * The neural matte is produced at 384/512/768 px and is therefore soft. This
  * implementation follows the "fast guided filter" idea:
  *
  *   1. downsample the guide (luma) and the matte by `subsample`,
@@ -10,9 +10,10 @@
  *   3. bilinearly upsample a/b and evaluate q = a * I + b at full resolution.
  *
  * That is equivalent to running the guided filter on the upsampled matte, but
- * it never allocates a full-resolution float matte. For a 24 MP photo the
- * full-resolution pass only needs the RGB bytes, two row buffers and the
- * output mask.
+ * it never allocates a full-resolution float matte. Every full-resolution
+ * pixel is evaluated: classifying whole 4x4 cells from the block-average
+ * texture and then filling them with 0/255 is not mathematically safe and can
+ * delete thin hair or create hard artefacts.
  */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) {
@@ -209,6 +210,44 @@
   }
 
   /*
+   * Bilinear lookup from full-resolution pixels to coarse-cell centers. The
+   * final cell can be partial, so its true center is not always at
+   * (i + 0.5) * subsample - 0.5. Using the actual centers avoids a 1.5 px edge
+   * shift on images whose size is not a multiple of the subsample factor.
+   */
+  function makeAxisInterpolation(fullSize, cellCount, subsample) {
+    var centers = new Float32Array(cellCount);
+    for (var i = 0; i < cellCount; i++) {
+      var from = i * subsample;
+      var to = Math.min(fullSize, from + subsample);
+      centers[i] = (from + to - 1) / 2;
+    }
+
+    var lo = new Int32Array(fullSize);
+    var hi = new Int32Array(fullSize);
+    var weight = new Float32Array(fullSize);
+    var cell = 0;
+    for (var x = 0; x < fullSize; x++) {
+      while (cell < cellCount - 1 && centers[cell] < x) cell++;
+      if (x <= centers[0]) {
+        lo[x] = 0;
+        hi[x] = 0;
+        weight[x] = 0;
+      } else if (x >= centers[cellCount - 1]) {
+        lo[x] = cellCount - 1;
+        hi[x] = cellCount - 1;
+        weight[x] = 0;
+      } else {
+        hi[x] = cell;
+        lo[x] = cell - 1;
+        var span = centers[cell] - centers[cell - 1];
+        weight[x] = span > 0 ? (x - centers[cell - 1]) / span : 0;
+      }
+    }
+    return { centers: centers, lo: lo, hi: hi, weight: weight };
+  }
+
+  /*
    * Refine the low-resolution alpha matte against the full-resolution RGB
    * image and return a full-resolution Uint8 mask.
    *
@@ -218,8 +257,13 @@
    *   subsample = 4,
    *   radius = 8,      // in FULL-resolution pixels, not coarse cells
    *   eps = 1e-4,
-   *   sharpen = 2      // matte contrast; 1 = keep the soft guided-filter ramp
+   *   sharpen = 1.4,   // matte contrast; 1 = keep the soft guided-filter ramp
+   *   respectSourceAlpha = true
    * }
+   *
+   * respectSourceAlpha must be false when the result is used as a layer mask:
+   * Photoshop applies the layer's existing alpha itself, so multiplying here
+   * would make semi-transparent pixels transparent twice.
    */
   function refine(opts) {
     var width = Math.max(1, Math.round(opts.width));
@@ -236,7 +280,8 @@
      */
     var radius = Math.max(1, Math.round(radiusFull / subsample));
     var eps = typeof opts.eps === 'number' ? opts.eps : 1e-4;
-    var sharpen = typeof opts.sharpen === 'number' ? opts.sharpen : 2;
+    var sharpen = typeof opts.sharpen === 'number' && opts.sharpen > 0 ? opts.sharpen : 1.4;
+    var respectSourceAlpha = opts.respectSourceAlpha !== false;
 
     var outW = Math.max(1, Math.ceil(width / subsample));
     var outH = Math.max(1, Math.ceil(height / subsample));
@@ -247,185 +292,63 @@
     var meanA = coeff.a;
     var meanB = coeff.b;
 
-    /*
-     * The coefficients a/b are smooth, so most 4x4 cells are either fully
-     * inside or fully outside the matte. We classify the coarse grid once and
-     * only evaluate q = a*I + b at full resolution on the narrow boundary
-     * band. That turns a 24 MP per-pixel pass into a few million operations.
-     */
-    var LOW = 0.002;
-    var HIGH = 0.998;
-
-    var smallCount = outW * outH;
-    var qSmall = new Float32Array(smallCount);
-    var rowMin = new Float32Array(outH);
-    var rowMax = new Float32Array(outH);
-    var i;
-    for (i = 0; i < smallCount; i++) {
-      qSmall[i] = meanA[i] * guide[i] + meanB[i];
-    }
-    for (var ry = 0; ry < outH; ry++) {
-      var base = ry * outW;
-      var lo = qSmall[base];
-      var hi = qSmall[base];
-      for (var rx = 1; rx < outW; rx++) {
-        var qv = qSmall[base + rx];
-        if (qv < lo) lo = qv;
-        if (qv > hi) hi = qv;
-      }
-      rowMin[ry] = lo;
-      rowMax[ry] = hi;
-    }
-
     var out = new Uint8Array(width * height);
-    var x0a = new Int32Array(width);
-    var x1a = new Int32Array(width);
-    var xfa = new Float32Array(width);
+    var xAxis = makeAxisInterpolation(width, outW, subsample);
+    var yAxis = makeAxisInterpolation(height, outH, subsample);
+    var x0a = xAxis.lo;
+    var x1a = xAxis.hi;
+    var xfa = xAxis.weight;
     var x;
 
-    for (x = 0; x < width; x++) {
-      var sx = (x + 0.5) / subsample - 0.5;
-      if (sx < 0) sx = 0;
-      if (sx > outW - 1) sx = outW - 1;
-      var ix0 = Math.floor(sx);
-      var fx = sx - ix0;
-      var ix1 = ix0 + 1;
-      if (ix1 >= outW) ix1 = outW - 1;
-      x0a[x] = ix0;
-      x1a[x] = ix1;
-      xfa[x] = fx;
-    }
-
-    /*
-     * x ranges that blend the coarse columns k and k+1. Pixels before
-     * start[0] use column 0 alone, pixels after start[outW-1] use the last
-     * column alone (both clamp at the borders).
-     */
-    var start = new Int32Array(outW);
-    for (var k = 0; k < outW; k++) {
-      start[k] = Math.ceil(subsample * k + subsample * 0.5 - 0.5);
-      if (start[k] < 0) start[k] = 0;
-      if (start[k] > width) start[k] = width;
-    }
-
-    function writeRange(xFrom, xTo, rowA, rowB, wy0, fy, rowPixel, rowOut) {
-      for (var px = xFrom; px < xTo; px++) {
-        var ci = x0a[px];
-        var cj = x1a[px];
-        var wx = xfa[px];
-
-        var a00 = meanA[rowA + ci];
-        var a01 = meanA[rowA + cj];
-        var a10 = meanA[rowB + ci];
-        var a11 = meanA[rowB + cj];
-        var av = ((a00 + (a01 - a00) * wx) * wy0 +
-          (a10 + (a11 - a10) * wx) * fy) * (1 / 255);
-
-        var b00 = meanB[rowA + ci];
-        var b01 = meanB[rowA + cj];
-        var b10 = meanB[rowB + ci];
-        var b11 = meanB[rowB + cj];
-        var bv = (b00 + (b01 - b00) * wx) * wy0 +
-          (b10 + (b11 - b10) * wx) * fy;
-
-        var off = rowPixel + px * components;
-        var luma = (77 * rgb[off] + 150 * rgb[off + 1] + 29 * rgb[off + 2] + 128) >> 8;
-        var q = av * luma + bv;
-        if (q <= 0) {
-          out[rowOut + px] = 0;
-        } else if (q >= 1) {
-          out[rowOut + px] = 255;
-        } else {
-          out[rowOut + px] = (q * 255 + 0.5) | 0;
-        }
-      }
-    }
-
-    var pairInside = new Uint8Array(outW);
-    var pairOutside = new Uint8Array(outW);
-    var lastIy = -1;
+    /* Coefficients interpolated vertically once per output row. */
+    var aRow = new Float32Array(outW);
+    var bRow = new Float32Array(outW);
+    var alphaMul = respectSourceAlpha && components === 4 ? 1 / 255 : 0;
+    var byteScale = 255;
+    var sharpenOffset = 0.5 - 0.5 * sharpen;
+    var sharpenScale = sharpen;
 
     for (var y = 0; y < height; y++) {
-      var sy = (y + 0.5) / subsample - 0.5;
-      if (sy < 0) sy = 0;
-      if (sy > outH - 1) sy = outH - 1;
-      var iy0 = Math.floor(sy);
-      var fy = sy - iy0;
-      var iy1 = iy0 + 1;
-      if (iy1 >= outH) iy1 = outH - 1;
+      var iy0 = yAxis.lo[y];
+      var iy1 = yAxis.hi[y];
+      var fy = yAxis.weight[y];
+
+      var r0 = iy0 * outW;
+      var r1 = iy1 * outW;
+      for (var c = 0; c < outW; c++) {
+        aRow[c] = meanA[r0 + c] + (meanA[r1 + c] - meanA[r0 + c]) * fy;
+        bRow[c] = meanB[r0 + c] + (meanB[r1 + c] - meanB[r0 + c]) * fy;
+      }
 
       var rowOut = y * width;
-      if (rowMax[iy0] <= LOW && rowMax[iy1] <= LOW) continue;
-      if (rowMin[iy0] >= HIGH && rowMin[iy1] >= HIGH) {
-        out.fill(255, rowOut, rowOut + width);
-        continue;
-      }
-
-      if (iy0 !== lastIy) {
-        var r0 = iy0 * outW;
-        var r1 = iy1 * outW;
-        for (var c = 0; c < outW; c++) {
-          var q0 = qSmall[r0 + c];
-          var q1 = qSmall[r1 + c];
-          pairInside[c] = q0 >= HIGH && q1 >= HIGH ? 1 : 0;
-          pairOutside[c] = q0 <= LOW && q1 <= LOW ? 1 : 0;
-        }
-        lastIy = iy0;
-      }
-
-      var rowA = iy0 * outW;
-      var rowB = iy1 * outW;
-      var wy0 = 1 - fy;
       var rowPixel = rowOut * components;
+      for (x = 0; x < width; x++) {
+        var ci = x0a[x];
+        var cj = x1a[x];
+        var wx = xfa[x];
+        var av = aRow[ci] + (aRow[cj] - aRow[ci]) * wx;
+        var bv = bRow[ci] + (bRow[cj] - bRow[ci]) * wx;
 
-      var headEnd = start[0] < width ? start[0] : width;
-      if (headEnd > 0) {
-        if (pairInside[0]) {
-          out.fill(255, rowOut, rowOut + headEnd);
-        } else if (!pairOutside[0]) {
-          writeRange(0, headEnd, rowA, rowB, wy0, fy, rowPixel, rowOut);
+        var off = rowPixel + x * components;
+        var luma = (77 * rgb[off] + 150 * rgb[off + 1] + 29 * rgb[off + 2] + 128) >> 8;
+        var q = av * (luma / 255) + bv;
+
+        /*
+         * Contrast is applied to the floating-point matte before quantization.
+         * q' = 0.5 + (q - 0.5) * sharpen, clamped to [0, 1].
+         */
+        q = q * sharpenScale + sharpenOffset;
+        if (q <= 0) {
+          q = 0;
+        } else if (q >= 1) {
+          q = 1;
         }
-      }
 
-      for (var col = 0; col < outW - 1; col++) {
-        var cx0 = start[col];
-        var cx1 = start[col + 1] < width ? start[col + 1] : width;
-        if (cx1 <= cx0) continue;
-        if (pairInside[col] && pairInside[col + 1]) {
-          out.fill(255, rowOut + cx0, rowOut + cx1);
-        } else if (!(pairOutside[col] && pairOutside[col + 1])) {
-          writeRange(cx0, cx1, rowA, rowB, wy0, fy, rowPixel, rowOut);
+        if (alphaMul && rgb[off + 3] !== 255) {
+          q *= rgb[off + 3] * alphaMul;
         }
-      }
 
-      var tailStart = start[outW - 1] < width ? start[outW - 1] : width;
-      if (tailStart < width) {
-        if (pairInside[outW - 1]) {
-          out.fill(255, rowOut + tailStart, rowOut + width);
-        } else if (!pairOutside[outW - 1]) {
-          writeRange(tailStart, width, rowA, rowB, wy0, fy, rowPixel, rowOut);
-        }
-      }
-    }
-
-    /* Transparent source pixels must stay transparent (RGBA documents). */
-    if (components === 4) {
-      for (i = 0, x = 3; i < out.length; i++, x += 4) {
-        var alphaByte = rgb[x];
-        if (alphaByte !== 255) out[i] = ((out[i] * alphaByte + 127) / 255) | 0;
-      }
-    }
-
-    /*
-     * The guided filter ramp is smooth by construction. A moderate contrast
-     * stretch keeps hair semi-transparent while turning the wide halo around
-     * clothes into a crisp edge. Values are stretched around 0.5, so the
-     * boundary position does not move.
-     */
-    if (sharpen !== 1) {
-      for (i = 0; i < out.length; i++) {
-        var q = 0.5 + (out[i] / 255 - 0.5) * sharpen;
-        out[i] = q <= 0 ? 0 : (q >= 1 ? 255 : (q * 255 + 0.5) | 0);
+        out[rowOut + x] = (q * byteScale + 0.5) | 0;
       }
     }
 
@@ -438,7 +361,8 @@
       subsample: subsample,
       radius: radius,
       radiusFull: radiusFull,
-      sharpen: sharpen
+      sharpen: sharpen,
+      respectSourceAlpha: respectSourceAlpha
     };
   }
 
@@ -448,8 +372,7 @@
     boxMeanFromIntegral: boxMeanFromIntegral,
     guidedFilterCoefficients: guidedFilterCoefficients,
     downsampleGuideLuma: downsampleGuideLuma,
+    makeAxisInterpolation: makeAxisInterpolation,
     refine: refine
   };
 });
-
-

@@ -220,7 +220,8 @@ async function main() {
     if (v > max) max = v;
     sum += v;
   }
-  check('mask spans the full 0..255 range', min === 0 && max === 255, min + '..' + max);
+  check('mask has background and high-confidence person pixels', min === 0 && max >= 128,
+    min + '..' + max);
   check('mask is not empty', sum > 0);
   check('timings reported', result.timings.inference > 0 && result.timings.pipeline > 0);
 
@@ -241,18 +242,62 @@ async function main() {
 
   section('session reuse on a second image');
 
+  const width2 = 320;
+  const height2 = 240;
+  const rgb2 = new Uint8Array(width2 * height2 * 3);
+  for (let y = 0; y < height2; y++) {
+    for (let x = 0; x < width2; x++) {
+      const dx = (x - width2 / 2) / (width2 * 0.3);
+      const dy = (y - height2 / 2) / (height2 * 0.4);
+      const inside = dx * dx + dy * dy < 1;
+      const i = (y * width2 + x) * 3;
+      rgb2[i] = inside ? 210 : 25;
+      rgb2[i + 1] = inside ? 170 : 35;
+      rgb2[i + 2] = inside ? 140 : 55;
+    }
+  }
+
   const result2 = await sandbox.FASEngine.segment({
-    rgb: rgb.subarray(0, 320 * 240 * 3),
-    width: 320,
-    height: 240,
+    rgb: rgb2,
+    width: width2,
+    height: height2,
     components: 3,
     targetLong: 512,
   });
-  check('second segment works', result2.mask.length === 320 * 240, String(result2.mask.length));
+  check('second segment works', result2.mask.length === width2 * height2, String(result2.mask.length));
   check('high mode uses 512', result2.inputHeight === 512 || result2.inputWidth === 512,
     result2.inputWidth + 'x' + result2.inputHeight);
   check('no extra session was created', instantiateCalls === 1, String(instantiateCalls));
   console.log('  info 512 mode inference ' + result2.timings.inference.toFixed(0) + ' ms');
+
+  section('maximum detail mode');
+
+  const result768 = await sandbox.FASEngine.segment({
+    rgb: rgb2,
+    width: width2,
+    height: height2,
+    components: 3,
+    targetLong: 768,
+    sharpen: 1.4,
+  });
+  check('768 mode keeps a 768 px network input',
+    Math.max(result768.inputWidth, result768.inputHeight) === 768,
+    result768.inputWidth + 'x' + result768.inputHeight);
+  check('768 mode still reuses the session', instantiateCalls === 1, String(instantiateCalls));
+  check('adaptive guided-filter radius is reported',
+    result768.radius >= 4 && result768.radius <= 16, String(result768.radius));
+  console.log('  info 768 mode inference ' + result768.timings.inference.toFixed(0) +
+    ' ms, radius ' + result768.radius);
+
+  section('session invalidation');
+
+  const oldSession = (await sandbox.FASEngine.ensureSession()).session;
+  sandbox.FASEngine.invalidate(new Error('synthetic timeout'));
+  check('invalidate drops the ready state', sandbox.FASEngine.isReady() === false);
+  const recovered = await sandbox.FASEngine.ensureSession();
+  check('a new session replaces the invalidated one',
+    recovered.session !== oldSession &&
+    sandbox.FASEngine.isReady() === true);
 
   console.log('');
   if (failures) {
